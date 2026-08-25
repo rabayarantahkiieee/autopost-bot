@@ -1,6 +1,6 @@
 # ⚽ PL News AutoPost Bot (Interaktif)
 
-Bot Telegram yang otomatis mengambil berita dari **premierleague.com** (+ sumber RSS tambahan), menerjemahkannya ke **Bahasa Indonesia**, lalu memposting ke channel kamu. Semua pengaturan dilakukan **langsung lewat chat ke bot** — tidak perlu edit file atau restart.
+Bot Telegram yang otomatis mengambil berita dari **Sky Sports Football** (+ sumber RSS tambahan), menerjemahkannya ke **Bahasa Indonesia**, lalu memposting ke channel kamu. Semua pengaturan dilakukan **langsung lewat chat ke bot** — tidak perlu edit file atau restart.
 
 
 ## ⭐ Fitur Unggulan: Menu Tombol `/settings`
@@ -8,7 +8,7 @@ Bot Telegram yang otomatis mengambil berita dari **premierleague.com** (+ sumber
 Ketik `/settings` di chat bot, dan semua pengaturan penting muncul sebagai **tombol yang tinggal dipencet** — tanpa mengetik command sama sekali:
 
 - ⏸/▶️ Jeda & lanjutkan posting (1 tombol)
-- ✅/❌ Nyalakan-matikan sumber premierleague.com
+- ✅/❌ Nyalakan-matikan sumber Sky Sports Football
 - ➖/➕ Atur jumlah post per hari
 - ➖/➕ Atur interval pengecekan berita
 - 👀 Preview calon post berikutnya (dikirim ke kamu, bukan ke channel)
@@ -29,7 +29,7 @@ Bot ini juga sudah diuji dengan **28 automated test** (`test_bot.py`) yang menca
 | `/sources` | Lihat daftar sumber berita |
 | `/addsource <url>` | Tambah sumber RSS baru |
 | `/delsource <nomor>` | Hapus sumber RSS |
-| `/plnews on/off` | Nyalakan/matikan sumber premierleague.com |
+| `/plnews on/off` | Nyalakan/matikan sumber Sky Sports Football |
 | `/setchannel <id>` | Atur channel tujuan (`@namachannel` atau `-100...`) |
 | `/setlimit <angka>` | Maksimal posting per hari |
 | `/setinterval <menit>` | Seberapa sering bot cek berita baru |
@@ -76,7 +76,7 @@ git push
 ## Kendala yang mungkin terjadi
 
 1. **Sumber X (Twitter) tidak stabil.** X memblokir akses baca gratis. Bridge gratis (Nitter dll.) sering mati. Kalau feed mati, bot tidak error — dia skip dan lanjut pakai sumber lain.
-2. **Endpoint premierleague.com bisa berubah.** Bot punya 2 metode (API + scrape HTML) sebagai cadangan, tapi kalau situsnya dirombak total, kode perlu disesuaikan.
+2. **Endpoint Sky Sports Football bisa berubah.** Bot punya 2 metode (API + scrape HTML) sebagai cadangan, tapi kalau situsnya dirombak total, kode perlu disesuaikan.
 3. **Google Translate gratis ada batas tak resmi.** Kalau posting sangat sering (ratusan/hari), translate bisa sesekali gagal — bot otomatis pakai teks asli sebagai cadangan.
 4. **Butuh hosting 24 jam.** Kalau dijalankan di laptop, bot mati saat laptop mati. Solusi: VPS murah, atau platform seperti Railway/Render (jalankan sebagai *worker*, bukan web service).
 5. **Bot harus admin di channel** dengan izin kirim pesan, kalau tidak `/testpost` akan gagal.

@@ -36,10 +36,21 @@ fp = types.ModuleType("feedparser")
 def parse(url):
     r = types.SimpleNamespace()
     r.feed = {"title": "Feed Uji"}
-    r.entries = [
-        {"id": f"{url}#1", "title": "Transfer news: Star striker joins", "link": url + "/1"},
-        {"id": f"{url}#2", "title": "Match report weekend", "link": url + "/2"},
-    ]
+    if "skysports" in url:
+        r.entries = [
+            {"id": "sky1", "title": "Arsenal win big", "summary": "desc",
+             "link": "https://www.skysports.com/football/news/12040/1",
+             "links": [{"type": "image/jpg", "href": "https://img.sky/1.jpg"}]},
+            {"id": "sky2", "title": "Darts final tonight", "summary": "",
+             "link": "https://www.skysports.com/darts/news/12040/2"},
+            {"id": "sky3", "title": "Tennis update", "summary": "",
+             "link": "https://www.skysports.com/tennis/news/12040/3"},
+        ]
+    else:
+        r.entries = [
+            {"id": f"{url}#1", "title": "Transfer news: Star striker joins", "link": url + "/1"},
+            {"id": f"{url}#2", "title": "Match report weekend", "link": url + "/2"},
+        ]
     return r
 fp.parse = parse
 sys.modules["feedparser"] = fp
