@@ -5,7 +5,7 @@
 #   /sources             -> lihat daftar sumber
 #   /addsource <url>     -> tambah sumber RSS (mis. bridge Nitter)
 #   /delsource <nomor>   -> hapus sumber
-#   /sky on|off          -> nyalakan/matikan sumber utama Sky Sports Football
+#   /utama on|off        -> nyalakan/matikan sumber utama ANTARA Sepakbola
 #   /setchannel <id>     -> atur channel tujuan
 #   /setlimit <angka>    -> maksimal posting per hari
 #   /setinterval <menit> -> jeda pengecekan berita
@@ -55,15 +55,17 @@ SETTINGS_FILE = DATA_DIR / "settings.json"
 STATE_FILE = DATA_DIR / "posted.json"
 MAX_SUMMARY_CHARS = 400
 
-# Sumber utama bawaan: feed Sky Sports (khusus artikel bola, disaring otomatis)
-SKY_FEED = "https://www.skysports.com/rss/12040"
+# Sumber utama bawaan: feed resmi ANTARA Sepakbola (Bahasa Indonesia, tanpa translate)
+MAIN_FEED = "https://www.antaranews.com/rss/sepakbola.xml"
+MAIN_NAME = "ANTARA Sepakbola"
 
 DEFAULT_SETTINGS = {
     "channel_id": "",          # diisi lewat /setchannel
     "posts_per_day": 6,
     "check_interval_min": 10,
     "target_lang": "id",
-    "sky_enabled": True,       # sumber utama: Sky Sports Football
+    "main_enabled": True,      # sumber utama: ANTARA Sepakbola (Bahasa Indonesia)
+    "translate_enabled": True, # terjemahkan sumber RSS tambahan yang berbahasa asing
     "rss_sources": [],         # daftar URL RSS tambahan (mis. Nitter)
     "paused": False,
     "keyword_filters": [],     # kalau diisi, hanya berita yang mengandung kata ini yang diposting
@@ -213,7 +215,7 @@ def parse_rss_entries(feed, source_name: str, limit: int, prefix: str,
             "id": prefix + (e.get("id") or link or title[:50]),
             "title": title,
             "summary": clean_html(e.get("summary") or e.get("description") or ""),
-            "link": link or SKY_FEED,
+            "link": link or MAIN_FEED,
             "source": source_name,
             "image": extract_entry_image(e),
         })
@@ -222,18 +224,18 @@ def parse_rss_entries(feed, source_name: str, limit: int, prefix: str,
     return items
 
 
-def fetch_sky_football(limit: int = 10) -> list[dict]:
-    """Sumber utama: feed Sky Sports, disaring khusus artikel bola (/football/)."""
-    if not settings.get("sky_enabled", True):
+def fetch_main_source(limit: int = 10) -> list[dict]:
+    """Sumber utama: feed resmi ANTARA Sepakbola. Sudah Bahasa Indonesia -> tanpa translate."""
+    if not settings.get("main_enabled", True):
         return []
     try:
-        feed = feedparser.parse(SKY_FEED)
-        return parse_rss_entries(
-            feed, "Sky Sports Football", limit, "sky-",
-            link_must_contain="/football/",
-        )
+        feed = feedparser.parse(MAIN_FEED)
+        items = parse_rss_entries(feed, MAIN_NAME, limit, "antara-")
+        for it in items:
+            it["no_translate"] = True   # konten sudah Bahasa Indonesia
+        return items
     except Exception as exc:
-        log.warning("Feed Sky Sports gagal: %s", exc)
+        log.warning("Feed %s gagal: %s", MAIN_NAME, exc)
         return []
 
 
@@ -258,8 +260,10 @@ def passes_filter(item: dict) -> bool:
 
 
 def build_message(item: dict) -> str:
-    title_id = translate(item["title"])
-    summary_id = translate(item["summary"][:MAX_SUMMARY_CHARS]) if item["summary"] else ""
+    skip = item.get("no_translate") or not settings.get("translate_enabled", True)
+    title_id = item["title"] if skip else translate(item["title"])
+    raw_sum = item["summary"][:MAX_SUMMARY_CHARS] if item["summary"] else ""
+    summary_id = raw_sum if skip else (translate(raw_sum) if raw_sum else "")
     parts = [f"⚽️ <b>{title_id}</b>"]
     if summary_id and summary_id.lower() != title_id.lower():
         parts.append(summary_id)
@@ -273,7 +277,7 @@ async def try_post_one(bot) -> str | None:
     """Cari 1 berita baru dan posting. Return judul kalau sukses."""
     if not settings["channel_id"]:
         return None
-    candidates = fetch_sky_football() + fetch_rss_sources()
+    candidates = fetch_main_source() + fetch_rss_sources()
     for item in candidates:
         if item["id"] in state["posted_ids"] or not passes_filter(item):
             continue
@@ -352,7 +356,8 @@ HELP_TEXT = (
     "/sources — lihat daftar sumber\n"
     "/addsource &lt;url_rss&gt; — tambah sumber RSS\n"
     "/delsource &lt;nomor&gt; — hapus sumber RSS\n"
-    "/sky on|off — sumber utama Sky Sports Football\n\n"
+    "/utama on|off — sumber utama ANTARA Sepakbola\n"
+    "/translate on|off — terjemahan utk sumber tambahan berbahasa asing\n\n"
     "<b>Pengaturan posting:</b>\n"
     "/setchannel &lt;id&gt; — channel/grup tujuan (mis. @channelku atau -100...)\n"
     "/settopic &lt;id&gt; — kirim ke topik tertentu (grup forum)\n"
@@ -389,9 +394,9 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rss = "\n".join(
         f"{i+1}. {u}" for i, u in enumerate(settings["rss_sources"])
     ) or "(tidak ada)"
-    sky = "✅ aktif" if settings.get("sky_enabled", True) else "❌ mati"
+    utama = "✅ aktif" if settings.get("main_enabled", True) else "❌ mati"
     await update.message.reply_text(
-        f"📰 Sumber berita:\n\n• Sky Sports Football (bawaan, otomatis + gambar): {sky}\n\nRSS tambahan:\n{rss}\n\n"
+        f"📰 Sumber berita:\n\n• {MAIN_NAME} (bawaan, Bahasa Indonesia + gambar): {utama}\n\nRSS tambahan:\n{rss}\n\n"
         "Tambah: /addsource <url>\nHapus: /delsource <nomor>"
     )
 
@@ -430,15 +435,32 @@ async def cmd_delsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
-async def cmd_sky(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_utama(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = (context.args[0].lower() if context.args else "")
     if arg not in ("on", "off"):
-        await update.message.reply_text("Format: /sky on  atau  /sky off")
+        await update.message.reply_text("Format: /utama on  atau  /utama off")
         return
-    settings["sky_enabled"] = arg == "on"
+    settings["main_enabled"] = arg == "on"
     save_settings()
     await update.message.reply_text(
-        f"Sumber Sky Sports Football sekarang: {'✅ aktif' if arg == 'on' else '❌ mati'}"
+        f"Sumber {MAIN_NAME} sekarang: {'✅ aktif' if arg == 'on' else '❌ mati'}"
+    )
+
+
+@owner_only
+async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    arg = (context.args[0].lower() if context.args else "")
+    if arg not in ("on", "off"):
+        await update.message.reply_text(
+            "Format: /translate on  atau  /translate off\n"
+            "(Hanya berlaku untuk sumber RSS tambahan berbahasa asing. "
+            f"Sumber utama {MAIN_NAME} sudah Bahasa Indonesia, tidak pernah diterjemahkan.)"
+        )
+        return
+    settings["translate_enabled"] = arg == "on"
+    save_settings()
+    await update.message.reply_text(
+        f"Terjemahan sumber tambahan: {'✅ aktif' if arg == 'on' else '❌ mati'}"
     )
 
 
@@ -602,7 +624,7 @@ async def cmd_clearfooter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Mengambil calon post berikutnya...")
-    candidates = fetch_sky_football() + fetch_rss_sources()
+    candidates = fetch_main_source() + fetch_rss_sources()
     for item in candidates:
         if item["id"] in state["posted_ids"] or not passes_filter(item):
             continue
@@ -641,8 +663,8 @@ def settings_keyboard() -> InlineKeyboardMarkup:
             f"{'▶️ Lanjutkan Posting' if p['paused'] else '⏸ Jeda Posting'}",
             callback_data="toggle_pause")],
         [InlineKeyboardButton(
-            f"Sky Sports: {'✅ AKTIF' if p.get('sky_enabled', True) else '❌ MATI'} (tekan utk ubah)",
-            callback_data="toggle_sky")],
+            f"ANTARA: {'✅ AKTIF' if p.get('main_enabled', True) else '❌ MATI'} (tekan utk ubah)",
+            callback_data="toggle_main")],
         [
             InlineKeyboardButton("➖", callback_data="limit_down"),
             InlineKeyboardButton(f"📮 {p['posts_per_day']} post/hari", callback_data="noop"),
@@ -693,8 +715,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "toggle_pause":
         settings["paused"] = not settings["paused"]
         await q.answer("Dijeda." if settings["paused"] else "Aktif lagi!")
-    elif action == "toggle_sky":
-        settings["sky_enabled"] = not settings.get("sky_enabled", True)
+    elif action == "toggle_main":
+        settings["main_enabled"] = not settings.get("main_enabled", True)
         await q.answer("Diubah!")
     elif action == "limit_up":
         settings["posts_per_day"] = min(settings["posts_per_day"] + 1, 100)
@@ -710,7 +732,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer(f"Tiap {settings['check_interval_min']} menit")
     elif action == "do_preview":
         await q.answer("Mengambil preview...")
-        candidates = fetch_sky_football() + fetch_rss_sources()
+        candidates = fetch_main_source() + fetch_rss_sources()
         sent = False
         for item in candidates:
             if item["id"] in state["posted_ids"] or not passes_filter(item):
@@ -765,7 +787,7 @@ async def cmd_status_body(message):
         f"Posting hari ini: {state['count_today']}/{settings['posts_per_day']}\n"
         f"Cek berita tiap: {settings['check_interval_min']} menit\n"
         f"Bahasa terjemahan: {settings['target_lang']}\n\n"
-        f"Sumber Sky Sports Football: {'✅ aktif' if settings.get('sky_enabled', True) else '❌ mati'}\n"
+        f"Sumber {MAIN_NAME}: {'✅ aktif' if settings.get('main_enabled', True) else '❌ mati'}\n"
         f"Sumber RSS tambahan:\n{rss}\n\n"
         f"Filter kata kunci: {', '.join(settings['keyword_filters']) or '(tidak ada — semua berita diposting)'}\n"
         f"Footer: {settings['footer'] or '(tidak ada)'}\n"
@@ -789,7 +811,7 @@ def main():
         "settings": cmd_settings,
         "status": cmd_status, "sources": cmd_sources,
         "addsource": cmd_addsource, "delsource": cmd_delsource,
-        "sky": cmd_sky, "setchannel": cmd_setchannel,
+        "utama": cmd_utama, "translate": cmd_translate, "setchannel": cmd_setchannel,
         "settopic": cmd_settopic, "cleartopic": cmd_cleartopic,
         "photos": cmd_photos,
         "setlimit": cmd_setlimit, "setinterval": cmd_setinterval,
