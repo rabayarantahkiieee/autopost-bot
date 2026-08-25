@@ -66,12 +66,14 @@ DEFAULT_SETTINGS = {
     "target_lang": "id",
     "main_enabled": True,      # sumber utama: ANTARA Sepakbola (Bahasa Indonesia)
     "translate_enabled": True, # terjemahkan sumber RSS tambahan yang berbahasa asing
-    "rss_sources": [],         # daftar URL RSS tambahan (mis. Nitter)
+    "rss_sources": [],         # daftar URL RSS tambahan
+    "source_names": {},        # nama kustom per URL sumber (diatur via /namasource)
     "paused": False,
     "keyword_filters": [],     # kalau diisi, hanya berita yang mengandung kata ini yang diposting
     "footer": "",              # teks tambahan di akhir tiap post (mis. hashtag / nama channel)
     "topic_id": 0,             # untuk grup ber-topik (forum): ID topik tujuan. 0 = tidak dipakai
     "photos_enabled": True,    # kirim gambar artikel sebagai foto (kalau tersedia)
+    "link_enabled": True,      # tampilkan baris "Baca selengkapnya" + link sumber
     "total_posted": 0,         # statistik total post sepanjang masa
 }
 
@@ -244,7 +246,8 @@ def fetch_rss_sources(limit_per_feed: int = 5) -> list[dict]:
     for url in settings["rss_sources"]:
         try:
             feed = feedparser.parse(url)
-            name = feed.feed.get("title", url)
+            name = settings.get("source_names", {}).get(url) \
+                or feed.feed.get("title", url)
             items += parse_rss_entries(feed, name, limit_per_feed, "rss-")
         except Exception as exc:
             log.warning("Feed %s gagal: %s", url, exc)
@@ -267,7 +270,8 @@ def build_message(item: dict) -> str:
     parts = [f"⚽️ <b>{title_id}</b>"]
     if summary_id and summary_id.lower() != title_id.lower():
         parts.append(summary_id)
-    parts.append(f'🔗 <a href="{item["link"]}">Baca selengkapnya</a> — {item["source"]}')
+    if settings.get("link_enabled", True):
+        parts.append(f'🔗 <a href="{item["link"]}">Baca selengkapnya</a> — {item["source"]}')
     if settings["footer"]:
         parts.append(settings["footer"])
     return "\n\n".join(parts)
@@ -374,6 +378,7 @@ HELP_TEXT = (
     "/sources — lihat daftar sumber\n"
     "/addsource &lt;url_rss&gt; — tambah sumber RSS\n"
     "/delsource &lt;nomor&gt; — hapus sumber RSS\n"
+    "/namasource &lt;nomor&gt; &lt;nama&gt; — ganti nama sumber di akhir post\n"
     "/utama on|off — sumber utama ANTARA Sepakbola\n"
     "/translate on|off — terjemahan utk sumber tambahan berbahasa asing\n\n"
     "<b>Pengaturan posting:</b>\n"
@@ -389,6 +394,7 @@ HELP_TEXT = (
     "/delfilter &lt;nomor&gt; — hapus filter\n"
     "/setfooter &lt;teks&gt; — teks/hashtag di akhir tiap post\n"
     "/photos on|off — sertakan gambar artikel atau teks saja\n"
+    "/link on|off — tampilkan/sembunyikan baris Baca selengkapnya\n"
     "/clearfooter — hapus footer\n\n"
     "<b>Lainnya:</b>\n"
     "/status — lihat semua pengaturan & statistik\n"
@@ -515,6 +521,25 @@ async def cmd_cleartopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    arg = (context.args[0].lower() if context.args else "")
+    if arg not in ("on", "off"):
+        await update.message.reply_text(
+            "Format: /link on  atau  /link off\n\n"
+            "Mengatur baris “🔗 Baca selengkapnya — sumber” di akhir post.\n"
+            "Catatan: link ini juga berfungsi sebagai atribusi ke sumber berita, "
+            "dan untuk post tanpa foto, link inilah yang memunculkan gambar preview Telegram."
+        )
+        return
+    settings["link_enabled"] = arg == "on"
+    save_settings()
+    await update.message.reply_text(
+        f"Baris link sumber: {'✅ ditampilkan' if arg == 'on' else '❌ disembunyikan'}\n"
+        "Cek hasilnya dengan /preview."
+    )
+
+
+@owner_only
 async def cmd_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = (context.args[0].lower() if context.args else "")
     if arg not in ("on", "off"):
@@ -618,6 +643,38 @@ async def cmd_delfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🗑 Filter dihapus: “{removed}”")
     except (IndexError, ValueError, TypeError):
         await update.message.reply_text("Format: /delfilter <nomor>\nLihat nomornya di /filters")
+
+
+@owner_only
+async def cmd_namasource(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Ganti nama sumber yang tampil di akhir post.\n\n"
+            "Format: /namasource <nomor> <nama baru>\n"
+            "Contoh: /namasource 1 Bola.net\n\n"
+            "Lihat nomor sumber di /sources.\n"
+            "Kembalikan ke nama asli feed: /namasource <nomor> reset"
+        )
+        return
+    try:
+        idx = int(context.args[0]) - 1
+        url = settings["rss_sources"][idx]
+    except (ValueError, IndexError):
+        await update.message.reply_text("Nomor tidak valid. Cek /sources.")
+        return
+    name = " ".join(context.args[1:]).strip()
+    names = settings.setdefault("source_names", {})
+    if name.lower() == "reset":
+        names.pop(url, None)
+        save_settings()
+        await update.message.reply_text("✅ Nama sumber dikembalikan ke judul asli feed.")
+        return
+    names[url] = name
+    save_settings()
+    await update.message.reply_text(
+        f"✅ Sumber #{idx + 1} sekarang tampil sebagai: “{name}”\n"
+        "Cek hasilnya dengan /preview."
+    )
 
 
 @owner_only
@@ -805,6 +862,7 @@ async def cmd_status_body(message):
         f"Footer: {settings['footer'] or '(tidak ada)'}\n"
         f"Topik grup: {settings.get('topic_id') or '(tidak dipakai)'}\n"
         f"Gambar artikel: {'✅ ikut dikirim' if settings.get('photos_enabled', True) else '❌ teks saja'}\n"
+        f"Baris link sumber: {'✅ tampil' if settings.get('link_enabled', True) else '❌ disembunyikan'}\n"
         f"Total post sepanjang masa: {settings.get('total_posted', 0)}"
     )
     await message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -822,10 +880,10 @@ def main():
         "start": cmd_start, "help": cmd_start,
         "settings": cmd_settings,
         "status": cmd_status, "sources": cmd_sources,
-        "addsource": cmd_addsource, "delsource": cmd_delsource,
+        "addsource": cmd_addsource, "delsource": cmd_delsource, "namasource": cmd_namasource,
         "utama": cmd_utama, "translate": cmd_translate, "setchannel": cmd_setchannel,
         "settopic": cmd_settopic, "cleartopic": cmd_cleartopic,
-        "photos": cmd_photos,
+        "photos": cmd_photos, "link": cmd_link,
         "setlimit": cmd_setlimit, "setinterval": cmd_setinterval,
         "pause": cmd_pause, "resume": cmd_resume,
         "testpost": cmd_testpost, "preview": cmd_preview,
