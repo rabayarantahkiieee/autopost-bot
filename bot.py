@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -123,14 +124,36 @@ def clean_html(raw: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Penanda halaman error Google Translate yang kadang dikembalikan sebagai "terjemahan"
+_TRANSLATE_GARBAGE = (
+    "that's an error", "that's all we know", "error 500", "server error",
+    "please try again later", "error 502", "error 503",
+)
+
+
+def _looks_like_error_page(original: str, result: str) -> bool:
+    low_res = (result or "").lower()
+    low_src = (original or "").lower()
+    return any(m in low_res and m not in low_src for m in _TRANSLATE_GARBAGE)
+
+
 def translate(text: str) -> str:
+    """Translate dengan aman: deteksi halaman error Google, retry 1x, fallback teks asli."""
     if not text:
         return text
-    try:
-        return GoogleTranslator(source="auto", target=settings["target_lang"]).translate(text[:4500])
-    except Exception as exc:
-        log.warning("Translate gagal (%s), pakai teks asli.", exc)
-        return text
+    for attempt in range(2):
+        try:
+            result = GoogleTranslator(
+                source="auto", target=settings["target_lang"]
+            ).translate(text[:4500])
+            if result and not _looks_like_error_page(text, result):
+                return result
+            log.warning("Hasil translate seperti halaman error (percobaan %d), ulangi...", attempt + 1)
+        except Exception as exc:
+            log.warning("Translate gagal (%s), percobaan %d.", exc, attempt + 1)
+        time.sleep(2)
+    log.warning("Translate menyerah, pakai teks asli.")
+    return text
 
 
 # ---------------- SUMBER BERITA ----------------
@@ -150,6 +173,29 @@ def extract_entry_image(e: dict) -> str:
         if str(l.get("type", "")).startswith("image") and l.get("href"):
             return l["href"]
     return img
+
+
+def fetch_og_image(link: str) -> str:
+    """Cadangan: ambil gambar utama (og:image) langsung dari halaman artikel."""
+    if not link:
+        return ""
+    try:
+        r = requests.get(
+            link, timeout=12,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for sel in (
+            {"property": "og:image"},
+            {"name": "twitter:image"},
+        ):
+            tag = soup.find("meta", attrs=sel)
+            if tag and tag.get("content", "").startswith("http"):
+                return tag["content"]
+    except Exception as exc:
+        log.warning("Gagal ambil og:image dari %s: %s", link, exc)
+    return ""
 
 
 def parse_rss_entries(feed, source_name: str, limit: int, prefix: str,
@@ -237,6 +283,9 @@ async def try_post_one(bot) -> str | None:
                 kwargs["message_thread_id"] = settings["topic_id"]
             msg = build_message(item)
             image = item.get("image", "")
+            # kalau feed tidak menyertakan gambar, intip halaman artikelnya
+            if settings.get("photos_enabled", True) and not image:
+                image = fetch_og_image(item.get("link", ""))
             sent_ok = False
             # kirim sebagai foto + caption kalau ada gambar & caption muat (batas Telegram: 1024)
             if settings.get("photos_enabled", True) and image and len(msg) <= 1024:
