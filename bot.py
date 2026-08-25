@@ -273,6 +273,14 @@ def build_message(item: dict) -> str:
     return "\n\n".join(parts)
 
 
+def resolve_image(item: dict) -> str:
+    """Gambar dari feed; kalau tidak ada, intip og:image halaman artikelnya."""
+    image = item.get("image", "")
+    if settings.get("photos_enabled", True) and not image:
+        image = fetch_og_image(item.get("link", ""))
+    return image if settings.get("photos_enabled", True) else ""
+
+
 async def try_post_one(bot) -> str | None:
     """Cari 1 berita baru dan posting. Return judul kalau sukses."""
     if not settings["channel_id"]:
@@ -286,10 +294,7 @@ async def try_post_one(bot) -> str | None:
             if settings.get("topic_id"):
                 kwargs["message_thread_id"] = settings["topic_id"]
             msg = build_message(item)
-            image = item.get("image", "")
-            # kalau feed tidak menyertakan gambar, intip halaman artikelnya
-            if settings.get("photos_enabled", True) and not image:
-                image = fetch_og_image(item.get("link", ""))
+            image = resolve_image(item)
             sent_ok = False
             # kirim sebagai foto + caption kalau ada gambar & caption muat (batas Telegram: 1024)
             if settings.get("photos_enabled", True) and image and len(msg) <= 1024:
@@ -321,6 +326,19 @@ async def try_post_one(bot) -> str | None:
             log.error("Gagal kirim: %s", exc)
             return None
     return None
+
+
+async def send_preview(message, item: dict):
+    """Kirim preview ke owner persis seperti tampilan post asli di channel."""
+    msg = "👀 <b>PREVIEW</b> (tidak dikirim ke channel):\n\n" + build_message(item)
+    image = resolve_image(item)
+    if image and len(msg) <= 1024:
+        try:
+            await message.reply_photo(photo=image, caption=msg, parse_mode=ParseMode.HTML)
+            return
+        except Exception as exc:
+            log.warning("Preview foto gagal (%s), fallback teks.", exc)
+    await message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
 # ---------------- LOOP POSTING OTOMATIS ----------------
@@ -628,10 +646,7 @@ async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for item in candidates:
         if item["id"] in state["posted_ids"] or not passes_filter(item):
             continue
-        await update.message.reply_text(
-            "👀 <b>PREVIEW</b> (tidak dikirim ke channel):\n\n" + build_message(item),
-            parse_mode=ParseMode.HTML,
-        )
+        await send_preview(update.message, item)
         return
     await update.message.reply_text(
         "Tidak ada berita baru yang lolos filter saat ini."
@@ -737,10 +752,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for item in candidates:
             if item["id"] in state["posted_ids"] or not passes_filter(item):
                 continue
-            await q.message.reply_text(
-                "👀 <b>PREVIEW</b> (tidak dikirim ke channel):\n\n" + build_message(item),
-                parse_mode=ParseMode.HTML,
-            )
+            await send_preview(q.message, item)
             sent = True
             break
         if not sent:
