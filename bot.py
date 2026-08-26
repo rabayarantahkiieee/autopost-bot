@@ -74,6 +74,7 @@ DEFAULT_SETTINGS = {
     "footer": "",              # teks tambahan di akhir tiap post (mis. hashtag / nama channel)
     "topic_id": 0,             # untuk grup ber-topik (forum): ID topik tujuan. 0 = tidak dipakai
     "photos_enabled": True,    # kirim gambar artikel sebagai foto (kalau tersedia)
+    "link_enabled": True,      # sertakan baris "Baca selengkapnya" (link ke artikel asli)
     "total_posted": 0,         # statistik total post sepanjang masa
 }
 
@@ -313,10 +314,11 @@ async def build_message(item: dict) -> str:
     parts = [f"⚽️ <b>{title_id}</b>"]
     if summary_id and summary_id.lower() != title_id.lower():
         parts.append(summary_id)
-    parts.append(
-        f'🔗 <a href="{html.escape(item["link"], quote=True)}">Baca selengkapnya</a> '
-        f"— {html.escape(item['source'])}"
-    )
+    if settings.get("link_enabled", True):
+        parts.append(
+            f'🔗 <a href="{html.escape(item["link"], quote=True)}">Baca selengkapnya</a> '
+            f"— {html.escape(item['source'])}"
+        )
     if settings["footer"]:
         parts.append(settings["footer"])
     return "\n\n".join(parts)
@@ -488,6 +490,7 @@ HELP_TEXT = (
     "/delfilter &lt;nomor&gt; — hapus filter\n"
     "/setfooter &lt;teks&gt; — teks/hashtag di akhir tiap post\n"
     "/photos on|off — sertakan gambar artikel atau teks saja\n"
+    "/link on|off — tampilkan atau sembunyikan link 'Baca selengkapnya'\n"
     "/clearfooter — hapus footer\n\n"
     "<b>Lainnya:</b>\n"
     "/status — lihat semua pengaturan & statistik\n"
@@ -685,6 +688,20 @@ async def cmd_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_settings()
     await update.message.reply_text(
         f"Gambar artikel: {'✅ ikut dikirim' if arg == 'on' else '❌ teks saja'}"
+    )
+
+
+@owner_only
+async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    arg = (context.args[0].lower() if context.args else "")
+    if arg not in ("on", "off"):
+        await update.message.reply_text("Format: /link on  atau  /link off")
+        return
+    settings["link_enabled"] = arg == "on"
+    save_settings()
+    await update.message.reply_text(
+        f"Link ke artikel asli (Baca selengkapnya): "
+        f"{'✅ ikut ditampilkan' if arg == 'on' else '❌ disembunyikan'}"
     )
 
 
@@ -1050,6 +1067,7 @@ async def cmd_status_body(message):
         f"Footer: {settings['footer'] or '(tidak ada)'}\n"
         f"Topik grup: {settings.get('topic_id') or '(tidak dipakai)'}\n"
         f"Gambar artikel: {'✅ ikut dikirim' if settings.get('photos_enabled', True) else '❌ teks saja'}\n"
+        f"Link 'Baca selengkapnya': {'✅ ditampilkan' if settings.get('link_enabled', True) else '❌ disembunyikan'}\n"
         f"Total post sepanjang masa: {settings.get('total_posted', 0)}"
     )
     await message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -1073,7 +1091,7 @@ def main():
         "setchannel": cmd_setchannel, "addchannel": cmd_addchannel,
         "delchannel": cmd_delchannel, "channels": cmd_channels,
         "settopic": cmd_settopic, "cleartopic": cmd_cleartopic,
-        "photos": cmd_photos,
+        "photos": cmd_photos, "link": cmd_link,
         "setlimit": cmd_setlimit, "setinterval": cmd_setinterval,
         "pause": cmd_pause, "resume": cmd_resume,
         "testpost": cmd_testpost, "preview": cmd_preview,

@@ -220,6 +220,15 @@ async def main():
     check("Footer ikut terpasang", "#EPL | @uji" in msg)
     check("Link sumber ada", "https://x.y/1" in msg)
 
+    # 5d. /link off: baris "Baca selengkapnya" harus hilang dari post
+    upd = FakeUpdate(); await bot.cmd_link(upd, FakeContext(["off"]))
+    check("/link off bekerja", bot.settings["link_enabled"] is False)
+    msg_no_link = await bot.build_message({"title": "Hello", "summary": "World news",
+                                           "link": "https://x.y/1", "source": "Uji"})
+    check("Link disembunyikan saat link_enabled=False", "https://x.y/1" not in msg_no_link)
+    upd = FakeUpdate(); await bot.cmd_link(upd, FakeContext(["on"]))
+    check("/link on mengembalikan link", bot.settings["link_enabled"] is True)
+
     # 5b. Build message: judul mengandung karakter HTML spesial harus di-escape
     # (kalau tidak, Telegram menolak kirim & autopost bisa macet total — lihat try_post_one)
     msg_html = await bot.build_message({
