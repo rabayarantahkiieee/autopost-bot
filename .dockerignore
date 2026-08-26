@@ -1,0 +1,7 @@
+.env
+settings.json
+posted.json
+__pycache__/
+*.pyc
+.git/
+README.md

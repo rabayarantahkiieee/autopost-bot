@@ -18,10 +18,10 @@
 # ============================================================
 
 import asyncio
+import html
 import json
 import logging
 import re
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +32,7 @@ from decouple import config
 from deep_translator import GoogleTranslator
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -54,26 +55,25 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = DATA_DIR / "settings.json"
 STATE_FILE = DATA_DIR / "posted.json"
 MAX_SUMMARY_CHARS = 400
+MAX_FLOOD_RETRIES = 3   # berapa kali coba lagi kalau kena flood-control (429) Telegram
 
 # Sumber utama bawaan: feed resmi ANTARA Sepakbola (Bahasa Indonesia, tanpa translate)
 MAIN_FEED = "https://www.antaranews.com/rss/sepakbola.xml"
 MAIN_NAME = "ANTARA Sepakbola"
 
 DEFAULT_SETTINGS = {
-    "channel_id": "",          # diisi lewat /setchannel
+    "channel_ids": [],         # diisi lewat /setchannel atau /addchannel (bisa lebih dari 1)
     "posts_per_day": 6,
     "check_interval_min": 10,
     "target_lang": "id",
     "main_enabled": True,      # sumber utama: ANTARA Sepakbola (Bahasa Indonesia)
     "translate_enabled": True, # terjemahkan sumber RSS tambahan yang berbahasa asing
-    "rss_sources": [],         # daftar URL RSS tambahan
-    "source_names": {},        # nama kustom per URL sumber (diatur via /namasource)
+    "rss_sources": [],         # daftar URL RSS tambahan (mis. Nitter)
     "paused": False,
     "keyword_filters": [],     # kalau diisi, hanya berita yang mengandung kata ini yang diposting
     "footer": "",              # teks tambahan di akhir tiap post (mis. hashtag / nama channel)
     "topic_id": 0,             # untuk grup ber-topik (forum): ID topik tujuan. 0 = tidak dipakai
     "photos_enabled": True,    # kirim gambar artikel sebagai foto (kalau tersedia)
-    "link_enabled": True,      # tampilkan baris "Baca selengkapnya" + link sumber
     "total_posted": 0,         # statistik total post sepanjang masa
 }
 
@@ -93,15 +93,26 @@ def save_json(path: Path, data):
 
 
 settings = {**DEFAULT_SETTINGS, **load_json(SETTINGS_FILE, {})}
+# migrasi dari format lama (1 channel_id string) ke channel_ids (list, dukung multi-channel)
+if settings.get("channel_id") and not settings.get("channel_ids"):
+    settings["channel_ids"] = [settings["channel_id"]]
+settings.pop("channel_id", None)
+
 state = load_json(STATE_FILE, {"posted_ids": [], "date": "", "count_today": 0})
+state.setdefault("posted_titles", [])   # judul (dinormalisasi) yg sudah diposting, lintas-sumber
+state.setdefault("history", [])         # riwayat post terakhir, untuk /riwayat
 
 
 def save_settings():
     save_json(SETTINGS_FILE, settings)
 
 
+HISTORY_LIMIT = 20
+
 def save_state():
     state["posted_ids"] = state["posted_ids"][-500:]
+    state["posted_titles"] = state["posted_titles"][-500:]
+    state["history"] = state["history"][:HISTORY_LIMIT]
     save_json(STATE_FILE, state)
 
 
@@ -141,21 +152,28 @@ def _looks_like_error_page(original: str, result: str) -> bool:
     return any(m in low_res and m not in low_src for m in _TRANSLATE_GARBAGE)
 
 
-def translate(text: str) -> str:
-    """Translate dengan aman: deteksi halaman error Google, retry 1x, fallback teks asli."""
+def _translate_sync(text: str) -> str:
+    return GoogleTranslator(source="auto", target=settings["target_lang"]).translate(text[:4500])
+
+
+async def translate(text: str) -> str:
+    """Translate dengan aman: deteksi halaman error Google, retry 1x, fallback teks asli.
+
+    Jalan lewat asyncio.to_thread supaya panggilan jaringan (blocking) dan jeda
+    retry tidak membekukan event loop bot (kalau tidak, semua command jadi tidak
+    merespons selama proses translate berlangsung).
+    """
     if not text:
         return text
     for attempt in range(2):
         try:
-            result = GoogleTranslator(
-                source="auto", target=settings["target_lang"]
-            ).translate(text[:4500])
+            result = await asyncio.to_thread(_translate_sync, text)
             if result and not _looks_like_error_page(text, result):
                 return result
             log.warning("Hasil translate seperti halaman error (percobaan %d), ulangi...", attempt + 1)
         except Exception as exc:
             log.warning("Translate gagal (%s), percobaan %d.", exc, attempt + 1)
-        time.sleep(2)
+        await asyncio.sleep(2)
     log.warning("Translate menyerah, pakai teks asli.")
     return text
 
@@ -179,13 +197,14 @@ def extract_entry_image(e: dict) -> str:
     return img
 
 
-def fetch_og_image(link: str) -> str:
+async def fetch_og_image(link: str) -> str:
     """Cadangan: ambil gambar utama (og:image) langsung dari halaman artikel."""
     if not link:
         return ""
     try:
-        r = requests.get(
-            link, timeout=12,
+        r = await asyncio.to_thread(
+            requests.get, link,
+            timeout=12,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
         )
         r.raise_for_status()
@@ -226,12 +245,12 @@ def parse_rss_entries(feed, source_name: str, limit: int, prefix: str,
     return items
 
 
-def fetch_main_source(limit: int = 10) -> list[dict]:
+async def fetch_main_source(limit: int = 10) -> list[dict]:
     """Sumber utama: feed resmi ANTARA Sepakbola. Sudah Bahasa Indonesia -> tanpa translate."""
     if not settings.get("main_enabled", True):
         return []
     try:
-        feed = feedparser.parse(MAIN_FEED)
+        feed = await asyncio.to_thread(feedparser.parse, MAIN_FEED)
         items = parse_rss_entries(feed, MAIN_NAME, limit, "antara-")
         for it in items:
             it["no_translate"] = True   # konten sudah Bahasa Indonesia
@@ -241,16 +260,20 @@ def fetch_main_source(limit: int = 10) -> list[dict]:
         return []
 
 
-def fetch_rss_sources(limit_per_feed: int = 5) -> list[dict]:
+async def fetch_one_rss_source(url: str, limit: int = 5) -> list[dict]:
+    try:
+        feed = await asyncio.to_thread(feedparser.parse, url)
+        name = feed.feed.get("title", url)
+        return parse_rss_entries(feed, name, limit, "rss-")
+    except Exception as exc:
+        log.warning("Feed %s gagal: %s", url, exc)
+        return []
+
+
+async def fetch_rss_sources(limit_per_feed: int = 5) -> list[dict]:
     items = []
     for url in settings["rss_sources"]:
-        try:
-            feed = feedparser.parse(url)
-            name = settings.get("source_names", {}).get(url) \
-                or feed.feed.get("title", url)
-            items += parse_rss_entries(feed, name, limit_per_feed, "rss-")
-        except Exception as exc:
-            log.warning("Feed %s gagal: %s", url, exc)
+        items += await fetch_one_rss_source(url, limit_per_feed)
     return items
 
 
@@ -262,87 +285,155 @@ def passes_filter(item: dict) -> bool:
     return any(k.lower() in text for k in settings["keyword_filters"])
 
 
-def build_message(item: dict) -> str:
+def normalize_title(title: str) -> str:
+    """Judul disederhanakan (huruf kecil, tanpa tanda baca/spasi ganda) supaya berita yang
+    sama tapi ditulis ulang oleh sumber lain (ID/link beda) tetap kedetek sebagai duplikat."""
+    t = title.lower()
+    t = re.sub(r"[^\w\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def is_new_item(item: dict) -> bool:
+    """False kalau item ini (by ID *atau* judul yang sama) sudah pernah diposting —
+    mencegah berita yang sama dari 2 sumber berbeda terkirim dobel ke channel."""
+    if item["id"] in state["posted_ids"]:
+        return False
+    if normalize_title(item["title"]) in state["posted_titles"]:
+        return False
+    return True
+
+
+async def build_message(item: dict) -> str:
     skip = item.get("no_translate") or not settings.get("translate_enabled", True)
-    title_id = item["title"] if skip else translate(item["title"])
+    title_id = item["title"] if skip else await translate(item["title"])
     raw_sum = item["summary"][:MAX_SUMMARY_CHARS] if item["summary"] else ""
-    summary_id = raw_sum if skip else (translate(raw_sum) if raw_sum else "")
+    summary_id = raw_sum if skip else (await translate(raw_sum) if raw_sum else "")
+    title_id = html.escape(title_id)
+    summary_id = html.escape(summary_id)
     parts = [f"⚽️ <b>{title_id}</b>"]
     if summary_id and summary_id.lower() != title_id.lower():
         parts.append(summary_id)
-    if settings.get("link_enabled", True):
-        parts.append(f'🔗 <a href="{item["link"]}">Baca selengkapnya</a> — {item["source"]}')
+    parts.append(
+        f'🔗 <a href="{html.escape(item["link"], quote=True)}">Baca selengkapnya</a> '
+        f"— {html.escape(item['source'])}"
+    )
     if settings["footer"]:
         parts.append(settings["footer"])
     return "\n\n".join(parts)
 
 
-def resolve_image(item: dict) -> str:
-    """Gambar dari feed; kalau tidak ada, intip og:image halaman artikelnya."""
+async def resolve_image(item: dict) -> str:
+    """URL gambar item: dari feed kalau ada, atau fallback og:image dari halaman artikel."""
     image = item.get("image", "")
     if settings.get("photos_enabled", True) and not image:
-        image = fetch_og_image(item.get("link", ""))
-    return image if settings.get("photos_enabled", True) else ""
+        image = await fetch_og_image(item.get("link", ""))
+    return image
+
+
+async def _send_with_flood_retry(func, *args, **kwargs):
+    """Panggil fungsi kirim Telegram; kalau kena flood-control (429/RetryAfter),
+    tunggu sesuai retry_after lalu coba lagi (maks MAX_FLOOD_RETRIES kali) alih-alih
+    langsung menyerah. Exception lain (bukan RetryAfter) langsung dilempar apa adanya."""
+    for attempt in range(MAX_FLOOD_RETRIES):
+        try:
+            return await func(*args, **kwargs)
+        except RetryAfter as exc:
+            wait = exc.retry_after + 1
+            log.warning(
+                "Kena flood-control Telegram (429), tunggu %ds lalu coba lagi (percobaan %d/%d)...",
+                wait, attempt + 1, MAX_FLOOD_RETRIES,
+            )
+            await asyncio.sleep(wait)
+    return await func(*args, **kwargs)  # percobaan terakhir: biarkan exception (kalau ada) naik
+
+
+async def _post_to_channel(bot, chat_id: str, msg: str, image: str) -> bool:
+    """Kirim 1 pesan ke 1 channel/grup. Return True kalau berhasil (foto atau teks)."""
+    kwargs = {}
+    if settings.get("topic_id"):
+        kwargs["message_thread_id"] = settings["topic_id"]
+    # kirim sebagai foto + caption kalau ada gambar & caption muat (batas Telegram: 1024)
+    if settings.get("photos_enabled", True) and image and len(msg) <= 1024:
+        try:
+            await _send_with_flood_retry(
+                bot.send_photo,
+                chat_id=chat_id,
+                photo=image,
+                caption=msg,
+                parse_mode=ParseMode.HTML,
+                **kwargs,
+            )
+            return True
+        except Exception as exc:
+            log.warning("Kirim foto ke %s gagal (%s), fallback ke teks.", chat_id, exc)
+    try:
+        await _send_with_flood_retry(
+            bot.send_message,
+            chat_id=chat_id,
+            text=msg,
+            parse_mode=ParseMode.HTML,
+            **kwargs,
+        )
+        return True
+    except Exception as exc:
+        log.error("Gagal kirim ke channel %s: %s", chat_id, exc)
+        return False
 
 
 async def try_post_one(bot) -> str | None:
-    """Cari 1 berita baru dan posting. Return judul kalau sukses."""
-    if not settings["channel_id"]:
+    """Cari 1 berita baru dan posting ke semua channel tujuan. Return judul kalau sukses."""
+    if not settings["channel_ids"]:
         return None
-    candidates = fetch_main_source() + fetch_rss_sources()
+    candidates = (await fetch_main_source()) + (await fetch_rss_sources())
     for item in candidates:
-        if item["id"] in state["posted_ids"] or not passes_filter(item):
+        if not is_new_item(item) or not passes_filter(item):
             continue
         try:
-            kwargs = {}
-            if settings.get("topic_id"):
-                kwargs["message_thread_id"] = settings["topic_id"]
-            msg = build_message(item)
-            image = resolve_image(item)
-            sent_ok = False
-            # kirim sebagai foto + caption kalau ada gambar & caption muat (batas Telegram: 1024)
-            if settings.get("photos_enabled", True) and image and len(msg) <= 1024:
-                try:
-                    await bot.send_photo(
-                        chat_id=settings["channel_id"],
-                        photo=image,
-                        caption=msg,
-                        parse_mode=ParseMode.HTML,
-                        **kwargs,
-                    )
-                    sent_ok = True
-                except Exception as exc:
-                    log.warning("Kirim foto gagal (%s), fallback ke teks.", exc)
-            if not sent_ok:
-                await bot.send_message(
-                    chat_id=settings["channel_id"],
-                    text=msg,
-                    parse_mode=ParseMode.HTML,
-                    **kwargs,
-                )
+            msg = await build_message(item)
+            image = await resolve_image(item)
+            results = [
+                await _post_to_channel(bot, chat_id, msg, image)
+                for chat_id in settings["channel_ids"]
+            ]
+            if not any(results):
+                log.error("Gagal kirim item %s ke SEMUA channel, coba kandidat berikutnya.", item.get("id"))
+                continue
             state["posted_ids"].append(item["id"])
+            state["posted_titles"].append(normalize_title(item["title"]))
             state["count_today"] += 1
             settings["total_posted"] = settings.get("total_posted", 0) + 1
+            state["history"].insert(0, {
+                "title": item["title"],
+                "link": item["link"],
+                "source": item["source"],
+                "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            })
+            state["history"] = state["history"][:HISTORY_LIMIT]
             save_settings()
             save_state()
             return item["title"]
         except Exception as exc:
-            log.error("Gagal kirim: %s", exc)
-            return None
+            log.error("Gagal kirim item %s (%s), coba kandidat berikutnya.", item.get("id"), exc)
+            continue
     return None
 
 
-async def send_preview(message, item: dict):
-    """Kirim preview ke owner persis seperti tampilan post asli di channel."""
-    msg = "👀 <b>PREVIEW</b> (tidak dikirim ke channel):\n\n" + build_message(item)
-    image = resolve_image(item)
-    if image and len(msg) <= 1024:
+async def send_preview(target, item: dict):
+    """Kirim pratinjau 1 item ke `target` (chat/query message) — sebisa mungkin
+    persis seperti yang akan dikirim ke channel asli, termasuk gambarnya
+    (dari feed atau fallback og:image), supaya /preview tidak menyesatkan."""
+    msg = await build_message(item)
+    image = await resolve_image(item)
+    caption = "👀 <b>PREVIEW</b> (tidak dikirim ke channel):\n\n" + msg
+    if settings.get("photos_enabled", True) and image and len(caption) <= 1024:
         try:
-            await message.reply_photo(photo=image, caption=msg, parse_mode=ParseMode.HTML)
+            await _send_with_flood_retry(
+                target.reply_photo, photo=image, caption=caption, parse_mode=ParseMode.HTML,
+            )
             return
         except Exception as exc:
-            log.warning("Preview foto gagal (%s), fallback teks.", exc)
-    await message.reply_text(msg, parse_mode=ParseMode.HTML)
+            log.warning("Preview: kirim foto gagal (%s), fallback ke teks.", exc)
+    await target.reply_text(caption, parse_mode=ParseMode.HTML)
 
 
 # ---------------- LOOP POSTING OTOMATIS ----------------
@@ -353,7 +444,7 @@ async def poster_loop(app: Application):
             reset_daily_quota_if_needed()
             if (
                 not settings["paused"]
-                and settings["channel_id"]
+                and settings["channel_ids"]
                 and state["count_today"] < settings["posts_per_day"]
             ):
                 min_gap = 86400 / max(settings["posts_per_day"], 1)
@@ -378,11 +469,14 @@ HELP_TEXT = (
     "/sources — lihat daftar sumber\n"
     "/addsource &lt;url_rss&gt; — tambah sumber RSS\n"
     "/delsource &lt;nomor&gt; — hapus sumber RSS\n"
-    "/namasource &lt;nomor&gt; &lt;nama&gt; — ganti nama sumber di akhir post\n"
+    "/checksources — cek semua sumber hidup/mati sekaligus\n"
     "/utama on|off — sumber utama ANTARA Sepakbola\n"
     "/translate on|off — terjemahan utk sumber tambahan berbahasa asing\n\n"
     "<b>Pengaturan posting:</b>\n"
-    "/setchannel &lt;id&gt; — channel/grup tujuan (mis. @channelku atau -100...)\n"
+    "/setchannel &lt;id&gt; — GANTI semua channel tujuan jadi 1 ini\n"
+    "/addchannel &lt;id&gt; — tambah channel tujuan (posting ke banyak channel)\n"
+    "/delchannel &lt;nomor&gt; — hapus 1 channel tujuan\n"
+    "/channels — lihat semua channel tujuan\n"
     "/settopic &lt;id&gt; — kirim ke topik tertentu (grup forum)\n"
     "/setlimit &lt;angka&gt; — maks posting per hari\n"
     "/setinterval &lt;menit&gt; — jeda cek berita\n"
@@ -394,11 +488,13 @@ HELP_TEXT = (
     "/delfilter &lt;nomor&gt; — hapus filter\n"
     "/setfooter &lt;teks&gt; — teks/hashtag di akhir tiap post\n"
     "/photos on|off — sertakan gambar artikel atau teks saja\n"
-    "/link on|off — tampilkan/sembunyikan baris Baca selengkapnya\n"
     "/clearfooter — hapus footer\n\n"
     "<b>Lainnya:</b>\n"
     "/status — lihat semua pengaturan & statistik\n"
-    "/preview — lihat calon post berikutnya (tanpa mengirim)\n"
+    "/riwayat — lihat post terakhir yang berhasil terkirim\n"
+    "/preview [nomor] — lihat calon post berikutnya (tanpa mengirim).\n"
+    "  Tanpa nomor = semua sumber. /preview utama = khusus ANTARA.\n"
+    "  /preview 2 = khusus sumber RSS nomor 2 (lihat nomornya di /sources)\n"
     "/testpost — kirim 1 post percobaan sekarang"
 )
 
@@ -414,6 +510,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    hist = state["history"]
+    if not hist:
+        await update.message.reply_text("Belum ada riwayat posting sama sekali.")
+        return
+    lines = []
+    for h in hist:
+        judul = html.escape(h["title"][:80])
+        link = html.escape(h["link"], quote=True)
+        sumber = html.escape(h["source"])
+        lines.append(f"🕘 {h['time']} UTC — <a href=\"{link}\">{judul}</a> ({sumber})")
+    await update.message.reply_text(
+        f"📜 <b>{len(hist)} Post Terakhir</b>\n\n" + "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@owner_only
 async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rss = "\n".join(
         f"{i+1}. {u}" for i, u in enumerate(settings["rss_sources"])
@@ -421,8 +536,46 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     utama = "✅ aktif" if settings.get("main_enabled", True) else "❌ mati"
     await update.message.reply_text(
         f"📰 Sumber berita:\n\n• {MAIN_NAME} (bawaan, Bahasa Indonesia + gambar): {utama}\n\nRSS tambahan:\n{rss}\n\n"
-        "Tambah: /addsource <url>\nHapus: /delsource <nomor>"
+        "Tambah: /addsource <url>\nHapus: /delsource <nomor>\nCek semua hidup/mati: /checksources"
     )
+
+
+async def _check_one_feed(url: str, label: str) -> str:
+    """Coba fetch 1 feed & ringkas hasilnya jadi 1 baris status untuk /checksources.
+    feedparser sering TIDAK melempar exception walau gagal (mis. URL 404/format
+    salah) — cuma menandai `bozo=1` dengan entries kosong — jadi dicek eksplisit,
+    bukan cuma andalkan try/except."""
+    label = html.escape(label)
+    try:
+        feed = await asyncio.to_thread(feedparser.parse, url)
+    except Exception as exc:
+        return f"❌ {label}: error ({html.escape(str(exc))})"
+    n = len(feed.entries)
+    if n == 0:
+        if getattr(feed, "bozo", 0):
+            reason = html.escape(str(getattr(feed, "bozo_exception", "format tidak dikenali / URL salah")))
+            return f"❌ {label}: gagal dibaca ({reason})"
+        return f"⚠️ {label}: 0 berita (feed kosong)"
+    return f"✅ {label}: {n} berita"
+
+
+@owner_only
+async def cmd_checksources(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Mengecek semua sumber, tunggu sebentar...")
+    lines = []
+    if settings.get("main_enabled", True):
+        lines.append(await _check_one_feed(MAIN_FEED, MAIN_NAME))
+    else:
+        lines.append(f"⏸ {html.escape(MAIN_NAME)}: dimatikan (/utama on utk aktifkan)")
+
+    if not settings["rss_sources"]:
+        lines.append("\n(tidak ada sumber RSS tambahan — /addsource <url>)")
+    else:
+        lines.append("")
+        for i, url in enumerate(settings["rss_sources"], start=1):
+            lines.append(await _check_one_feed(url, f"#{i} {url}"))
+
+    await update.message.reply_text("🔍 <b>Cek Sumber</b>\n\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @owner_only
@@ -435,7 +588,7 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("URL harus diawali http:// atau https://")
         return
     # tes dulu feed-nya kebaca atau nggak
-    feed = feedparser.parse(url)
+    feed = await asyncio.to_thread(feedparser.parse, url)
     if not feed.entries:
         await update.message.reply_text(
             "⚠️ Feed itu tidak terbaca / kosong. Tetap kusimpan, tapi cek lagi URL-nya ya."
@@ -449,6 +602,8 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_delsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         idx = int(context.args[0]) - 1
+        if idx < 0:
+            raise ValueError
         removed = settings["rss_sources"].pop(idx)
         save_settings()
         await update.message.reply_text(f"🗑 Dihapus:\n{removed}")
@@ -521,25 +676,6 @@ async def cmd_cleartopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
-async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    arg = (context.args[0].lower() if context.args else "")
-    if arg not in ("on", "off"):
-        await update.message.reply_text(
-            "Format: /link on  atau  /link off\n\n"
-            "Mengatur baris “🔗 Baca selengkapnya — sumber” di akhir post.\n"
-            "Catatan: link ini juga berfungsi sebagai atribusi ke sumber berita, "
-            "dan untuk post tanpa foto, link inilah yang memunculkan gambar preview Telegram."
-        )
-        return
-    settings["link_enabled"] = arg == "on"
-    save_settings()
-    await update.message.reply_text(
-        f"Baris link sumber: {'✅ ditampilkan' if arg == 'on' else '❌ disembunyikan'}\n"
-        "Cek hasilnya dengan /preview."
-    )
-
-
-@owner_only
 async def cmd_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = (context.args[0].lower() if context.args else "")
     if arg not in ("on", "off"):
@@ -557,14 +693,68 @@ async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "Format: /setchannel @namachannel  atau  /setchannel -1001234567890\n"
+            "Ini MENGGANTI semua channel tujuan jadi cuma 1 ini.\n"
+            "Mau posting ke beberapa channel sekaligus? Pakai /addchannel.\n"
             "Jangan lupa jadikan bot ini admin di channel tersebut!"
         )
         return
-    settings["channel_id"] = context.args[0]
+    settings["channel_ids"] = [context.args[0]]
     save_settings()
     await update.message.reply_text(
-        f"✅ Channel tujuan diatur ke: {settings['channel_id']}\n"
+        f"✅ Channel tujuan diatur ke: {context.args[0]}\n"
         "Coba /testpost untuk memastikan bot bisa mengirim ke sana."
+    )
+
+
+@owner_only
+async def cmd_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Format: /addchannel @namachannel  atau  /addchannel -1001234567890\n"
+            "Menambah channel tujuan TANPA menghapus yang sudah ada — bot akan "
+            "posting ke semua channel sekaligus.\n"
+            "Jangan lupa jadikan bot ini admin di channel tersebut!"
+        )
+        return
+    cid = context.args[0]
+    if cid in settings["channel_ids"]:
+        await update.message.reply_text(f"Channel {cid} sudah ada di daftar.")
+        return
+    settings["channel_ids"].append(cid)
+    save_settings()
+    await update.message.reply_text(
+        f"✅ Channel ditambahkan: {cid}\n"
+        f"Total sekarang: {len(settings['channel_ids'])} channel. Lihat: /channels"
+    )
+
+
+@owner_only
+async def cmd_delchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        idx = int(context.args[0]) - 1
+        if idx < 0:
+            raise ValueError
+        removed = settings["channel_ids"].pop(idx)
+        save_settings()
+        await update.message.reply_text(f"🗑 Channel dihapus:\n{removed}")
+    except (IndexError, ValueError, TypeError):
+        await update.message.reply_text(
+            "Format: /delchannel <nomor>\nLihat nomornya di /channels"
+        )
+
+
+@owner_only
+async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not settings["channel_ids"]:
+        await update.message.reply_text(
+            "⚠️ Belum ada channel tujuan.\nAtur: /setchannel <id>  atau  /addchannel <id>"
+        )
+        return
+    lst = "\n".join(f"{i+1}. {c}" for i, c in enumerate(settings["channel_ids"]))
+    await update.message.reply_text(
+        f"📡 Channel tujuan ({len(settings['channel_ids'])}):\n{lst}\n\n"
+        "Tambah: /addchannel <id>\nHapus: /delchannel <nomor>\n"
+        "Ganti semua jadi 1: /setchannel <id>"
     )
 
 
@@ -638,43 +828,13 @@ async def cmd_addfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_delfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         idx = int(context.args[0]) - 1
+        if idx < 0:
+            raise ValueError
         removed = settings["keyword_filters"].pop(idx)
         save_settings()
         await update.message.reply_text(f"🗑 Filter dihapus: “{removed}”")
     except (IndexError, ValueError, TypeError):
         await update.message.reply_text("Format: /delfilter <nomor>\nLihat nomornya di /filters")
-
-
-@owner_only
-async def cmd_namasource(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Ganti nama sumber yang tampil di akhir post.\n\n"
-            "Format: /namasource <nomor> <nama baru>\n"
-            "Contoh: /namasource 1 Bola.net\n\n"
-            "Lihat nomor sumber di /sources.\n"
-            "Kembalikan ke nama asli feed: /namasource <nomor> reset"
-        )
-        return
-    try:
-        idx = int(context.args[0]) - 1
-        url = settings["rss_sources"][idx]
-    except (ValueError, IndexError):
-        await update.message.reply_text("Nomor tidak valid. Cek /sources.")
-        return
-    name = " ".join(context.args[1:]).strip()
-    names = settings.setdefault("source_names", {})
-    if name.lower() == "reset":
-        names.pop(url, None)
-        save_settings()
-        await update.message.reply_text("✅ Nama sumber dikembalikan ke judul asli feed.")
-        return
-    names[url] = name
-    save_settings()
-    await update.message.reply_text(
-        f"✅ Sumber #{idx + 1} sekarang tampil sebagai: “{name}”\n"
-        "Cek hasilnya dengan /preview."
-    )
 
 
 @owner_only
@@ -698,21 +858,47 @@ async def cmd_clearfooter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Mengambil calon post berikutnya...")
-    candidates = fetch_main_source() + fetch_rss_sources()
+    arg = context.args[0].lower() if context.args else ""
+    if arg and arg != "utama" and not arg.isdigit():
+        await update.message.reply_text(
+            "Format: /preview [nomor]\n\n"
+            "Tanpa nomor — preview berita terbaru dari SEMUA sumber.\n"
+            "/preview utama — khusus sumber utama ANTARA Sepakbola.\n"
+            "/preview <nomor> — khusus sumber RSS nomor itu (lihat nomornya di /sources)."
+        )
+        return
+
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if not 0 <= idx < len(settings["rss_sources"]):
+            await update.message.reply_text(
+                "Nomor sumber tidak ada. Lihat nomornya di /sources."
+            )
+            return
+        await update.message.reply_text(
+            f"⏳ Mengambil calon post berikutnya dari sumber #{idx + 1}..."
+        )
+        candidates = await fetch_one_rss_source(settings["rss_sources"][idx])
+    elif arg == "utama":
+        await update.message.reply_text(f"⏳ Mengambil calon post berikutnya dari {MAIN_NAME}...")
+        candidates = await fetch_main_source()
+    else:
+        await update.message.reply_text("⏳ Mengambil calon post berikutnya...")
+        candidates = (await fetch_main_source()) + (await fetch_rss_sources())
+
     for item in candidates:
-        if item["id"] in state["posted_ids"] or not passes_filter(item):
+        if not is_new_item(item) or not passes_filter(item):
             continue
         await send_preview(update.message, item)
         return
     await update.message.reply_text(
-        "Tidak ada berita baru yang lolos filter saat ini."
+        "Tidak ada berita baru yang lolos filter saat ini dari sumber itu."
     )
 
 
 @owner_only
 async def cmd_testpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not settings["channel_id"]:
+    if not settings["channel_ids"]:
         await update.message.reply_text("Atur channel dulu: /setchannel <id>")
         return
     await update.message.reply_text("⏳ Mencari berita untuk post percobaan...")
@@ -757,9 +943,10 @@ def settings_keyboard() -> InlineKeyboardMarkup:
 
 
 def settings_text() -> str:
+    channels = ", ".join(settings["channel_ids"]) or "⚠️ belum diatur — pakai /setchannel"
     return (
         "⚙️ <b>Pengaturan Cepat</b>\n\n"
-        f"Channel: <code>{settings['channel_id'] or '⚠️ belum diatur — pakai /setchannel'}</code>\n"
+        f"Channel: <code>{channels}</code>\n"
         f"Status: {'⏸ dijeda' if settings['paused'] else '▶️ aktif'} · "
         f"Hari ini: {state['count_today']}/{settings['posts_per_day']} post\n\n"
         "Tekan tombol di bawah untuk mengubah pengaturan.\n"
@@ -804,10 +991,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer(f"Tiap {settings['check_interval_min']} menit")
     elif action == "do_preview":
         await q.answer("Mengambil preview...")
-        candidates = fetch_main_source() + fetch_rss_sources()
+        candidates = (await fetch_main_source()) + (await fetch_rss_sources())
         sent = False
         for item in candidates:
-            if item["id"] in state["posted_ids"] or not passes_filter(item):
+            if not is_new_item(item) or not passes_filter(item):
                 continue
             await send_preview(q.message, item)
             sent = True
@@ -816,7 +1003,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("Tidak ada berita baru yang lolos filter saat ini.")
         return
     elif action == "do_testpost":
-        if not settings["channel_id"]:
+        if not settings["channel_ids"]:
             await q.answer("Atur channel dulu: /setchannel", show_alert=True)
             return
         await q.answer("Mengirim test post...")
@@ -849,9 +1036,10 @@ async def cmd_status_body(message):
     rss = "\n".join(
         f"  {i+1}. {u}" for i, u in enumerate(settings["rss_sources"])
     ) or "  (tidak ada)"
+    channels = ", ".join(settings["channel_ids"]) or "belum diatur"
     msg = (
         "📊 <b>Status Bot</b>\n\n"
-        f"Channel tujuan: <code>{settings['channel_id'] or 'belum diatur'}</code>\n"
+        f"Channel tujuan: <code>{channels}</code>\n"
         f"Status: {'⏸ dijeda' if settings['paused'] else '▶️ aktif'}\n"
         f"Posting hari ini: {state['count_today']}/{settings['posts_per_day']}\n"
         f"Cek berita tiap: {settings['check_interval_min']} menit\n"
@@ -862,7 +1050,6 @@ async def cmd_status_body(message):
         f"Footer: {settings['footer'] or '(tidak ada)'}\n"
         f"Topik grup: {settings.get('topic_id') or '(tidak dipakai)'}\n"
         f"Gambar artikel: {'✅ ikut dikirim' if settings.get('photos_enabled', True) else '❌ teks saja'}\n"
-        f"Baris link sumber: {'✅ tampil' if settings.get('link_enabled', True) else '❌ disembunyikan'}\n"
         f"Total post sepanjang masa: {settings.get('total_posted', 0)}"
     )
     await message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -879,11 +1066,14 @@ def main():
     handlers = {
         "start": cmd_start, "help": cmd_start,
         "settings": cmd_settings,
-        "status": cmd_status, "sources": cmd_sources,
-        "addsource": cmd_addsource, "delsource": cmd_delsource, "namasource": cmd_namasource,
-        "utama": cmd_utama, "translate": cmd_translate, "setchannel": cmd_setchannel,
+        "status": cmd_status, "riwayat": cmd_riwayat,
+        "sources": cmd_sources, "checksources": cmd_checksources,
+        "addsource": cmd_addsource, "delsource": cmd_delsource,
+        "utama": cmd_utama, "translate": cmd_translate,
+        "setchannel": cmd_setchannel, "addchannel": cmd_addchannel,
+        "delchannel": cmd_delchannel, "channels": cmd_channels,
         "settopic": cmd_settopic, "cleartopic": cmd_cleartopic,
-        "photos": cmd_photos, "link": cmd_link,
+        "photos": cmd_photos,
         "setlimit": cmd_setlimit, "setinterval": cmd_setinterval,
         "pause": cmd_pause, "resume": cmd_resume,
         "testpost": cmd_testpost, "preview": cmd_preview,

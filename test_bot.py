@@ -1,7 +1,7 @@
 """
 Test suite untuk bot.py — menjalankan logika bot tanpa internet
 dengan meniru (stub) library eksternal: telegram, feedparser,
-deep_translator, decouple.
+deep_translator, decouple, requests.
 """
 import asyncio
 import json
@@ -31,21 +31,36 @@ class GoogleTranslator:
 dt.GoogleTranslator = GoogleTranslator
 sys.modules["deep_translator"] = dt
 
+# ---------- STUB: requests (dipakai fetch_og_image, harus tanpa internet) ----------
+req = types.ModuleType("requests")
+class _FakeResponse:
+    text = "<html><head></head><body></body></html>"
+    def raise_for_status(self): pass
+def _get(*a, **kw):
+    return _FakeResponse()
+req.get = _get
+sys.modules["requests"] = req
+
 # ---------- STUB: feedparser ----------
 fp = types.ModuleType("feedparser")
 def parse(url):
     r = types.SimpleNamespace()
     r.feed = {"title": "Feed Uji"}
-    if "skysports" in url:
+    if "antaranews" in url:
         r.entries = [
-            {"id": "sky1", "title": "Arsenal win big", "summary": "desc",
-             "link": "https://www.skysports.com/football/news/12040/1",
-             "links": [{"type": "image/jpg", "href": "https://img.sky/1.jpg"}]},
-            {"id": "sky2", "title": "Darts final tonight", "summary": "",
-             "link": "https://www.skysports.com/darts/news/12040/2"},
-            {"id": "sky3", "title": "Tennis update", "summary": "",
-             "link": "https://www.skysports.com/tennis/news/12040/3"},
+            {"id": "antara1", "title": "Persija menang besar & PSSI puas", "summary": "desc",
+             "link": "https://www.antaranews.com/berita/1/persija-menang",
+             "links": [{"type": "image/jpg", "href": "https://img.antara/1.jpg"}]},
+            {"id": "antara2", "title": "Timnas siap tanding", "summary": "",
+             "link": "https://www.antaranews.com/berita/2/timnas-siap"},
         ]
+    elif "kosong" in url:
+        r.entries = []
+        r.bozo = 0
+    elif "rusak" in url:
+        r.entries = []
+        r.bozo = 1
+        r.bozo_exception = "XML tidak valid"
     else:
         r.entries = [
             {"id": f"{url}#1", "title": "Transfer news: Star striker joins", "link": url + "/1"},
@@ -73,6 +88,15 @@ class ParseMode: HTML = "HTML"
 tgc.ParseMode = ParseMode
 sys.modules["telegram.constants"] = tgc
 
+tgerr = types.ModuleType("telegram.error")
+class RetryAfter(Exception):
+    """Tiruan telegram.error.RetryAfter — dilempar Telegram saat kena flood-control (429)."""
+    def __init__(self, retry_after):
+        super().__init__(f"Flood control: retry in {retry_after}s")
+        self.retry_after = retry_after
+tgerr.RetryAfter = RetryAfter
+sys.modules["telegram.error"] = tgerr
+
 tge = types.ModuleType("telegram.ext")
 class Application:
     @staticmethod
@@ -97,6 +121,7 @@ sys.modules["telegram.ext"] = tge
 class FakeMessage:
     def __init__(self): self.sent = []
     async def reply_text(self, text, **kw): self.sent.append(text)
+    async def reply_photo(self, photo=None, caption=None, **kw): self.sent.append(caption)
 
 class FakeUser:
     def __init__(self, uid): self.id = uid
@@ -104,6 +129,19 @@ class FakeUser:
 class FakeBot:
     def __init__(self): self.sent = []
     async def send_message(self, chat_id=None, text=None, **kw):
+        self.sent.append((chat_id, text))
+    # sengaja tidak ada send_photo -> try_post_one harus fallback ke send_message
+
+class FloodBot:
+    """Simulasi bot yang kena flood-control (429) `fail_times` kali sebelum akhirnya berhasil."""
+    def __init__(self, fail_times=1):
+        self.sent = []
+        self.attempts = 0
+        self.fail_times = fail_times
+    async def send_message(self, chat_id=None, text=None, **kw):
+        self.attempts += 1
+        if self.attempts <= self.fail_times:
+            raise bot.RetryAfter(0)
         self.sent.append((chat_id, text))
 
 class FakeQuery:
@@ -144,10 +182,10 @@ async def main():
     check("Default: 6 post/hari", bot.settings["posts_per_day"] == 6)
 
     # 2. Simpan & muat ulang settings
-    bot.settings["channel_id"] = "@uji"
+    bot.settings["channel_ids"] = ["@uji"]
     bot.save_settings()
     reloaded = json.loads((DATA / "settings.json").read_text())
-    check("Settings tersimpan ke disk", reloaded["channel_id"] == "@uji")
+    check("Settings tersimpan ke disk", reloaded["channel_ids"] == ["@uji"])
 
     # 3. Reset kuota harian
     bot.state["date"] = "2020-01-01"; bot.state["count_today"] = 99
@@ -163,20 +201,52 @@ async def main():
     check("Filter 'transfer': berita lain tertahan", not bot.passes_filter(item_m))
     bot.settings["keyword_filters"] = []
 
+    # 4b. Dedupe lintas-sumber: judul sama dari 2 sumber beda (ID beda) = dianggap duplikat
+    item_src1 = {"id": "antara-x1", "title": "Timnas Menang Telak!", "summary": ""}
+    item_src2 = {"id": "rss-y1", "title": "timnas menang telak", "summary": ""}  # sumber lain
+    check("Item yang judulnya belum pernah diposting dianggap baru", bot.is_new_item(item_src1))
+    bot.state["posted_ids"].append(item_src1["id"])
+    bot.state["posted_titles"].append(bot.normalize_title(item_src1["title"]))
+    check("Judul sama dari sumber lain (ID beda) dianggap SUDAH diposting (anti-tabrakan)",
+          not bot.is_new_item(item_src2))
+    item_src3 = {"id": "rss-y2", "title": "Berita yang sama sekali berbeda", "summary": ""}
+    check("Judul benar-benar beda tetap dianggap baru", bot.is_new_item(item_src3))
+
     # 5. Build message: terjemahan + footer + link
     bot.settings["footer"] = "#EPL | @uji"
-    msg = bot.build_message({"title": "Hello", "summary": "World news",
-                             "link": "https://x.y/1", "source": "Uji"})
+    msg = await bot.build_message({"title": "Hello", "summary": "World news",
+                                   "link": "https://x.y/1", "source": "Uji"})
     check("Judul diterjemahkan", "[ID]Hello" in msg)
     check("Footer ikut terpasang", "#EPL | @uji" in msg)
     check("Link sumber ada", "https://x.y/1" in msg)
 
+    # 5b. Build message: judul mengandung karakter HTML spesial harus di-escape
+    # (kalau tidak, Telegram menolak kirim & autopost bisa macet total — lihat try_post_one)
+    msg_html = await bot.build_message({
+        "title": "Arsenal & Chelsea <preview>", "summary": "",
+        "link": "https://x.y/2", "source": "Uji",
+    })
+    check("Karakter '&' di judul di-escape", "&amp;" in msg_html)
+    check("Karakter '<' di judul di-escape (bukan tag liar)", "&lt;preview&gt;" in msg_html)
+
+    # 5c. Sumber utama (no_translate=True) tidak boleh ikut diterjemahkan
+    msg_no_tr = await bot.build_message({
+        "title": "Sudah Bahasa Indonesia", "summary": "", "link": "https://x.y/3",
+        "source": "Uji", "no_translate": True,
+    })
+    check("no_translate: judul TIDAK diterjemahkan", "[ID]" not in msg_no_tr)
+
     # 6. RSS source fetch (via stub feedparser)
     bot.settings["rss_sources"] = ["https://feed.uji/rss"]
-    items = bot.fetch_rss_sources()
+    items = await bot.fetch_rss_sources()
     check("RSS terbaca 2 item", len(items) == 2)
 
-    # 7. try_post_one: kirim + dedupe + statistik
+    # 6b. Sumber utama ANTARA (via stub feedparser)
+    main_items = await bot.fetch_main_source()
+    check("Sumber utama ANTARA terbaca", len(main_items) == 2)
+    check("Sumber utama ditandai no_translate", all(it.get("no_translate") for it in main_items))
+
+    # 7. try_post_one: kirim + dedupe + statistik (fallback ke teks krn FakeBot tanpa send_photo)
     fb = FakeBot()
     title = await bot.try_post_one(fb)
     check("Post pertama terkirim", title is not None and len(fb.sent) == 1)
@@ -203,6 +273,114 @@ async def main():
     check("/setfooter gabung kata", bot.settings["footer"] == "#PL News")
     upd = FakeUpdate(); await bot.cmd_status(upd, FakeContext())
     check("/status merender tanpa error", any("Status Bot" in s for s in upd.message.sent))
+    upd = FakeUpdate(); await bot.cmd_utama(upd, FakeContext(["off"]))
+    check("/utama off bekerja", bot.settings["main_enabled"] is False)
+    upd = FakeUpdate(); await bot.cmd_utama(upd, FakeContext(["on"]))
+    check("/utama on bekerja", bot.settings["main_enabled"] is True)
+    upd = FakeUpdate(); await bot.cmd_translate(upd, FakeContext(["off"]))
+    check("/translate off bekerja", bot.settings["translate_enabled"] is False)
+    upd = FakeUpdate(); await bot.cmd_translate(upd, FakeContext(["on"]))
+    check("/translate on bekerja", bot.settings["translate_enabled"] is True)
+
+    # 9b. /delsource dan /delfilter dengan nomor 0 (di luar jangkauan) harus DITOLAK,
+    # bukan diam-diam menghapus item terakhir (bug indexing negatif Python)
+    bot.settings["rss_sources"] = ["https://a.uji/rss", "https://b.uji/rss"]
+    upd = FakeUpdate(); await bot.cmd_delsource(upd, FakeContext(["0"]))
+    check("/delsource 0 ditolak, tidak hapus apa pun",
+          len(bot.settings["rss_sources"]) == 2 and any("Format" in s for s in upd.message.sent))
+    bot.settings["keyword_filters"] = ["a", "b"]
+    upd = FakeUpdate(); await bot.cmd_delfilter(upd, FakeContext(["0"]))
+    check("/delfilter 0 ditolak, tidak hapus apa pun",
+          len(bot.settings["keyword_filters"]) == 2 and any("Format" in s for s in upd.message.sent))
+    bot.settings["keyword_filters"] = []
+
+    # 9c. Flood-control Telegram (429/RetryAfter): harus retry otomatis, bukan langsung gagal
+    bot.settings["rss_sources"] = ["https://flood.uji/rss"]
+    flood_bot = FloodBot(fail_times=1)
+    title = await bot.try_post_one(flood_bot)
+    check(
+        "Kena flood-control tapi tetap terkirim setelah retry",
+        title is not None and flood_bot.attempts == 2 and len(flood_bot.sent) == 1,
+    )
+
+    # 9d. send_preview: pakai reply_photo kalau item ada gambar, reply_text kalau tidak
+    class _CapturingMessage:
+        def __init__(self):
+            self.photo_calls = []
+            self.text_calls = []
+        async def reply_photo(self, photo=None, caption=None, **kw):
+            self.photo_calls.append((photo, caption))
+        async def reply_text(self, text, **kw):
+            self.text_calls.append(text)
+
+    cap = _CapturingMessage()
+    await bot.send_preview(cap, {
+        "id": "prev-1", "title": "Judul dengan gambar", "summary": "",
+        "link": "https://x.y/gambar", "source": "Uji", "image": "https://img.uji/1.jpg",
+    })
+    check("send_preview pakai reply_photo kalau ada gambar",
+          len(cap.photo_calls) == 1 and len(cap.text_calls) == 0)
+
+    cap2 = _CapturingMessage()
+    await bot.send_preview(cap2, {
+        "id": "prev-2", "title": "Judul tanpa gambar", "summary": "",
+        "link": "https://x.y/tanpa-gambar", "source": "Uji", "image": "",
+    })
+    check("send_preview fallback ke reply_text kalau tidak ada gambar",
+          len(cap2.text_calls) == 1 and len(cap2.photo_calls) == 0)
+
+    # 9e. /preview <nomor>: preview khusus 1 sumber RSS, bukan gabungan semua sumber
+    bot.settings["rss_sources"] = ["https://source-a.uji/rss", "https://source-b.uji/rss"]
+    upd = FakeUpdate(); await bot.cmd_preview(upd, FakeContext(["2"]))
+    check("/preview 2 ambil dari sumber RSS ke-2, bukan ke-1",
+          any("source-b.uji" in s for s in upd.message.sent if isinstance(s, str)))
+
+    upd = FakeUpdate(); await bot.cmd_preview(upd, FakeContext(["99"]))
+    check("/preview nomor di luar jangkauan ditolak",
+          any("tidak ada" in s.lower() for s in upd.message.sent))
+
+    upd = FakeUpdate(); await bot.cmd_preview(upd, FakeContext(["utama"]))
+    check("/preview utama hanya cari di sumber utama (sudah full-posted -> tidak ada baru)",
+          any("Tidak ada berita baru" in s for s in upd.message.sent))
+
+    # 9f. Multi-channel: /setchannel, /addchannel, /channels, /delchannel
+    bot.settings["channel_ids"] = []
+    upd = FakeUpdate(); await bot.cmd_setchannel(upd, FakeContext(["@utama"]))
+    check("/setchannel mengatur 1 channel", bot.settings["channel_ids"] == ["@utama"])
+    upd = FakeUpdate(); await bot.cmd_addchannel(upd, FakeContext(["@kedua"]))
+    check("/addchannel menambah TANPA menghapus yang lama",
+          bot.settings["channel_ids"] == ["@utama", "@kedua"])
+    upd = FakeUpdate(); await bot.cmd_addchannel(upd, FakeContext(["@utama"]))
+    check("/addchannel channel yang sudah ada tidak didobelin",
+          bot.settings["channel_ids"] == ["@utama", "@kedua"])
+    upd = FakeUpdate(); await bot.cmd_channels(upd, FakeContext())
+    check("/channels menampilkan semua channel",
+          any("@utama" in s and "@kedua" in s for s in upd.message.sent))
+    upd = FakeUpdate(); await bot.cmd_delchannel(upd, FakeContext(["0"]))
+    check("/delchannel 0 ditolak (index negatif)", bot.settings["channel_ids"] == ["@utama", "@kedua"])
+    upd = FakeUpdate(); await bot.cmd_delchannel(upd, FakeContext(["1"]))
+    check("/delchannel 1 menghapus channel pertama", bot.settings["channel_ids"] == ["@kedua"])
+
+    # 9g. Multi-channel: 1 post harus terkirim ke SEMUA channel tujuan sekaligus
+    bot.settings["channel_ids"] = ["@chanA", "@chanB"]
+    bot.settings["rss_sources"] = ["https://multichan.uji/rss"]
+    multi_bot = FakeBot()
+    title = await bot.try_post_one(multi_bot)
+    check("Multi-channel: post terkirim ke semua channel sekaligus",
+          title is not None and {c for c, _ in multi_bot.sent} == {"@chanA", "@chanB"})
+
+    # 9h. /checksources: lapor status per sumber (hidup / kosong / rusak)
+    bot.settings["rss_sources"] = ["https://ok.uji/rss", "https://kosong.uji/rss", "https://rusak.uji/rss"]
+    upd = FakeUpdate(); await bot.cmd_checksources(upd, FakeContext())
+    report = "\n".join(upd.message.sent)
+    check("/checksources: sumber normal ditandai sukses (✅)", "✅ #1" in report)
+    check("/checksources: sumber kosong ditandai peringatan (⚠️)", "⚠️ #2" in report)
+    check("/checksources: sumber rusak/bozo ditandai gagal (❌)", "❌ #3" in report)
+
+    # 9i. /riwayat: menampilkan post yang baru saja berhasil terkirim (dari 9g)
+    upd = FakeUpdate(); await bot.cmd_riwayat(upd, FakeContext())
+    check("/riwayat menampilkan histori post",
+          any("Post Terakhir" in s for s in upd.message.sent))
 
     # 10. FITUR UNGGULAN: tombol /settings
     kb = bot.settings_keyboard()
